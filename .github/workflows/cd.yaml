@@ -1,0 +1,108 @@
+# CD (S0): after ci.yaml succeeds on a push to main, deploy the image it built on the app host
+# (self-hosted runner, label lab-app) with deploy/compose.app.yaml, then smoke-test it.
+#
+# Two ways in:
+#   workflow_run       the normal path. The tag comes from CI's `image-tag` artifact, never computed here.
+#   workflow_dispatch  rollback: deploy an older tag by hand, e.g.
+#                        gh workflow run cd.yaml -f image_tag=41-1a2b3c4
+#                      List tags: gh api "users/<owner>/packages/container/<repo>%2Fapp/versions" --jq '.[].metadata.container.tags[]'
+#
+# Never triggered by pull_request. workflow_run only deploys a successful *push* run from *this*
+# repo: a fork's PR CI run (even from a branch named main) also fires workflow_run.
+name: cd
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (rollback), e.g. 41-1a2b3c4"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-app
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: [self-hosted, lab-app]
+    permissions:
+      contents: read
+      packages: read
+      actions: read # CI's image-tag artifact
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # The commit CI built, so the Compose file matches the image. A rollback uses main's.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Get the tag from CI
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: image-tag
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/ci
+
+      - name: Which tag
+        id: tag
+        env:
+          DISPATCH_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            tag="$DISPATCH_TAG"
+          else
+            tag=$(tr -d '[:space:]' < "$RUNNER_TEMP/ci/image-tag")
+          fi
+          [[ "$tag" =~ ^[0-9]+-[0-9a-f]{7}$ ]] || { echo "not a <run>-<sha7> tag: '$tag'" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Deploying app:$tag"
+
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          export IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker compose -f deploy/compose.app.yaml pull
+          docker compose -f deploy/compose.app.yaml up -d --wait --remove-orphans
+
+      - name: Smoke test through Traefik
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          base=http://127.0.0.1
+          v=$(curl -fsS --retry 10 --retry-all-errors --retry-delay 3 "$base/version")
+          echo "$v"
+          # The running image is the one we asked for: its tag, and the commit in that tag.
+          jq -e --arg tag "$IMAGE_TAG" --arg sha "${IMAGE_TAG#*-}" \
+            '.image_tag == $tag and (.git_sha | startswith($sha))' <<<"$v" >/dev/null
+          curl -fsS -X POST "$base/predict" -H 'Content-Type: application/json' \
+            -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}'
+          echo
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/predict" -H 'Content-Type: application/json' \
+            -d '{"pickup_zone_id": 999, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}')
+          [[ "$code" == 422 ]] || { echo "invalid zone returned $code, expected 422" >&2; exit 1; }
+          echo "smoke ok: app:$IMAGE_TAG"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
