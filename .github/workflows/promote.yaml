@@ -75,8 +75,13 @@ jobs:
           previous=$(jq -r '.model_version.version // "none"' <<<"$out")
 
           # Write it down before moving anything: on the new version (visible in MLflow) and in the run summary.
-          curl -fsS -X POST "$api/model-versions/set-tag" -H 'Content-Type: application/json' \
-            -d "$(jq -cn --arg n "$NAME" --arg v "$VERSION" --arg p "$previous" '{name: $n, version: $v, key: "previous_champion", value: $p}')" >/dev/null
+          # Re-running for the version that is already champion must not overwrite the real predecessor.
+          if [[ "$previous" != "$VERSION" ]]; then
+            curl -fsS -X POST "$api/model-versions/set-tag" -H 'Content-Type: application/json' \
+              -d "$(jq -cn --arg n "$NAME" --arg v "$VERSION" --arg p "$previous" '{name: $n, version: $v, key: "previous_champion", value: $p}')" >/dev/null
+          else
+            echo "version $VERSION is already champion: keeping its previous_champion tag"
+          fi
           curl -fsS -X POST "$api/registered-models/alias" -H 'Content-Type: application/json' \
             -d "$(jq -cn --arg n "$NAME" --arg v "$VERSION" '{name: $n, alias: "champion", version: $v}')" >/dev/null
 
@@ -95,11 +100,18 @@ jobs:
         env:
           VERSION: ${{ steps.pick.outputs.version }}
         run: |
-          p=$(curl -fsS --retry 5 --retry-all-errors --retry-delay 2 -X POST http://127.0.0.1/predict \
-            -H 'Content-Type: application/json' \
-            -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}')
-          echo "$p"
-          jq -e --arg v "$VERSION" '.model.alias == "champion" and .model.version == $v' <<<"$p" >/dev/null \
-            || { echo "/predict is not answered by champion version $VERSION" >&2; exit 1; }
-          echo "promoted: /predict answered by champion version $VERSION"
-          deploy/web.sh status
+          # Traefik health-checks serving every 5 s (deploy/traefik/web/routes.yaml), so for a few seconds
+          # after the reload the app can still get no champion and quote the static median. Wait for it.
+          for attempt in $(seq 1 12); do
+            p=$(curl -sS -m 10 -X POST http://127.0.0.1/predict -H 'Content-Type: application/json' \
+              -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}' || true)
+            echo "attempt $attempt: $p"
+            if jq -e --arg v "$VERSION" '.model.alias == "champion" and .model.version == $v' <<<"$p" >/dev/null 2>&1; then
+              echo "promoted: /predict answered by champion version $VERSION"
+              deploy/web.sh status
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "/predict is not answered by champion version $VERSION after 60 s" >&2
+          exit 1
