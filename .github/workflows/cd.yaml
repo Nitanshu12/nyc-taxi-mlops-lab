@@ -117,11 +117,15 @@ jobs:
           export IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
           # Each colour keeps the tag it runs; only the idle one changes.
           other=$([[ "$IDLE" == blue ]] && echo green || echo blue)
+          other_tag=$(deploy/web.sh tag "$other")
           if [[ "$IDLE" == blue ]]; then
-            export BLUE_TAG="$IMAGE_TAG" GREEN_TAG="$(deploy/web.sh tag "$other")"
+            BLUE_TAG="$IMAGE_TAG"
+            GREEN_TAG="$other_tag"
           else
-            export GREEN_TAG="$IMAGE_TAG" BLUE_TAG="$(deploy/web.sh tag "$other")"
+            GREEN_TAG="$IMAGE_TAG"
+            BLUE_TAG="$other_tag"
           fi
+          export BLUE_TAG GREEN_TAG
           docker compose -f deploy/compose.web.yaml pull "app-$IDLE"
           docker compose -f deploy/compose.web.yaml up -d --wait --no-deps --remove-orphans "app-$IDLE"
 
