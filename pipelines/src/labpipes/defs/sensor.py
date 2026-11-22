@@ -20,8 +20,8 @@ from ..resources import DataBucket
 # The job covers every asset from trip_files to zone_hour_stats. We select by key so that
 # adding new assets later doesn't silently widen the job beyond ingest.
 _INGEST_ASSETS = dg.AssetSelection.assets(
-    "trip_files", "raw_trips", "stg_trips", "zone_hour_stats"
-) | dg.AssetSelection.checks_for_assets("trip_files")
+    "trip_files", "raw_trips", "stg_trips", "zone_hour_stats", "trip_features"
+) | dg.AssetSelection.checks_for_assets("trip_files", "stg_trips", "trip_features")
 
 trip_files_job = dg.define_asset_job(
     "trip_files_job",
