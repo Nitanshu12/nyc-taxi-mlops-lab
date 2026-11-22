@@ -2,6 +2,9 @@
 // before it's sent. Grafana Cloud's free tier allows 10,000 active series for all hosts together
 // (contracts/metrics.yaml). With no rules, everything is sent.
 //
+// Route A of decision 014: keep only what a dashboard, an SLO or an incident would use, and drop labels
+// that change on every deploy. Rules run in order: `keep` by name first, then the label rules.
+//
 // Rules are Prometheus relabelling (https://grafana.com/docs/alloy/latest/reference/components/prometheus/prometheus.relabel/):
 //   rule { source_labels = ["__name__"]  regex = "node_(cpu|memory)_.*"  action = "keep" }
 //   rule { regex = "id"  action = "labeldrop" }
@@ -12,7 +15,27 @@ declare "host" {
 	prometheus.relabel "rules" {
 		forward_to = argument.forward_to.value
 
-		// Your rules for the host's series: CPU? memory? disk? which network devices?
+		// CPU, memory, disk and network (node_exporter), plus `up` (is the host's scrape alive?) and the
+		// boot time (did the host reboot?). Everything else node_exporter has is dropped by default.
+		rule {
+			source_labels = ["__name__"]
+			regex         = "up|node_boot_time_seconds|node_cpu_seconds_total|node_memory_(MemTotal|MemAvailable)_bytes|node_filesystem_(size|avail)_bytes|node_disk_(read_bytes|written_bytes|io_time_seconds)_total|node_network_(receive|transmit)_(bytes|errs|drop)_total"
+			action        = "keep"
+		}
+
+		// Only the real network card and disk: not the loopback, the Docker bridges and veth pairs (one
+		// per container, and they change on every deploy), nor the disk's partitions.
+		rule {
+			source_labels = ["__name__", "device"]
+			regex         = "node_network_.*;(lo|docker0|br-.*|veth.*)"
+			action        = "drop"
+		}
+
+		rule {
+			source_labels = ["__name__", "device"]
+			regex         = "node_disk_.*;nvme[0-9]+n[0-9]+p[0-9]+"
+			action        = "drop"
+		}
 	}
 
 	export "receiver" {
@@ -26,7 +49,28 @@ declare "containers" {
 	prometheus.relabel "rules" {
 		forward_to = argument.forward_to.value
 
-		// Your rules for the containers' series: which metrics, and which labels change on every deploy?
+		// Per container: memory (the dashboard), CPU, when it started (a restart shows as a new start
+		// time) and OOM kills. cAdvisor's other ~100 metrics per container are dropped.
+		rule {
+			source_labels = ["__name__"]
+			regex         = "container_(memory_working_set_bytes|cpu_usage_seconds_total|start_time_seconds|oom_events_total)"
+			action        = "keep"
+		}
+
+		// The cgroup root and the host's own slices have no container name.
+		rule {
+			source_labels = ["name"]
+			regex         = ""
+			action        = "drop"
+		}
+
+		// `name` identifies the container and stays. `id` is a cgroup path, `image` carries the tag and
+		// the container_label_* labels carry Compose's per-deploy values: all change on every deploy and
+		// would make a fresh series each time.
+		rule {
+			regex  = "id|image|container_label_.*"
+			action = "labeldrop"
+		}
 	}
 
 	export "receiver" {
@@ -40,7 +84,14 @@ declare "services" {
 	prometheus.relabel "rules" {
 		forward_to = argument.forward_to.value
 
-		// Your rules for the services' series (contracts/metrics.yaml, Traefik, runtime metrics).
+		// The metrics contract (every lab_* series: SLOs, dashboard, S8's canary), Traefik's per-service
+		// request counts and latency (what the canary compares), and `up`. The Python runtime's
+		// process_* and python_* metrics, and Traefik's per-entrypoint ones, are dropped.
+		rule {
+			source_labels = ["__name__"]
+			regex         = "up|lab_.*|traefik_service_(requests_total|request_duration_seconds_(bucket|sum|count))"
+			action        = "keep"
+		}
 	}
 
 	export "receiver" {
