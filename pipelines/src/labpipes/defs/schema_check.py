@@ -54,7 +54,7 @@ def schema_contract(
             f"column count: got {len(footer.columns)}, expected {len(expected)}"
         )
     else:
-        for i, (got, exp) in enumerate(zip(footer.columns, expected)):
+        for i, (got, exp) in enumerate(zip(footer.columns, expected, strict=True)):
             if got.name.lower() != exp.name.lower():
                 mismatches.append(
                     f"col[{i}] name: got '{got.name}', expected '{exp.name}'"
