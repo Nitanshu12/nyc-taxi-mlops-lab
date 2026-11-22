@@ -190,9 +190,16 @@ jobs:
           IMAGE_TAG: ${{ needs.deploy.outputs.tag }}
         run: |
           deploy/web.sh switch "$IDLE"
-          # Through Traefik with no pinning header: what a rider reaches now.
-          v=$(curl -fsS --retry 10 --retry-all-errors --retry-delay 2 http://127.0.0.1/version)
-          echo "$v"
-          jq -e --arg tag "$IMAGE_TAG" '.image_tag == $tag' <<<"$v" >/dev/null \
-            || { echo "traffic does not reach app:$IMAGE_TAG after the switch" >&2; exit 1; }
+          # Traefik's file watcher takes a moment to load the new routing, so wait until riders (no
+          # pinning header) actually reach the new image instead of checking once.
+          for attempt in $(seq 1 15); do
+            v=$(curl -sS -m 5 http://127.0.0.1/version || true)
+            echo "attempt $attempt: $v"
+            if jq -e --arg tag "$IMAGE_TAG" '.image_tag == $tag' <<<"$v" >/dev/null 2>&1; then
+              echo "traffic reaches app:$IMAGE_TAG"
+              break
+            fi
+            [[ $attempt -lt 15 ]] || { echo "traffic does not reach app:$IMAGE_TAG 30 s after the switch" >&2; exit 1; }
+            sleep 2
+          done
           deploy/web.sh status
