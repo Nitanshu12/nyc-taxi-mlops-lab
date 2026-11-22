@@ -21,6 +21,7 @@ import tripmodel
 from tripmodel import BaselineModel, LightGBMModel, evaluate, model_signature
 
 from ..contracts import features_contract, mlflow_contract
+from ..partitions import check_month
 from ..resources import ArtifactBucket, MlflowTracking, RedshiftData
 
 
@@ -48,7 +49,12 @@ def training_set(
 ) -> dg.MaterializeResult:
     """UNLOAD train window, holdout month, and zone-pair distances to the artifact bucket."""
     train_months, holdout_month, window = _get_window_and_holdout(redshift)
+    for m in [*train_months, holdout_month]:
+        check_month(m)  # formatted into SQL below
+    # Inside UNLOAD ('...') the query is itself a string literal, so its quotes are doubled ('');
+    # a plain query uses single quotes. Mixing the two is a Redshift syntax error.
     train_in = ", ".join(f"''{m}''" for m in train_months)
+    train_in_plain = ", ".join(f"'{m}'" for m in train_months)
 
     bucket = artifacts.bucket
     # UNLOAD statements into artifact bucket
@@ -69,7 +75,7 @@ def training_set(
     )
 
     counts = redshift.query(
-        f"select count(case when trip_month in ({train_in}) then 1 end) as train, "
+        f"select count(case when trip_month in ({train_in_plain}) then 1 end) as train, "
         f"count(case when trip_month = '{holdout_month}' then 1 end) as holdout "
         "from staging.trip_features"
     )

@@ -6,7 +6,7 @@ from mlflow import MlflowClient
 from labpipes.contracts import mlflow_contract
 from labpipes.defs import training
 from labpipes.resources import MlflowTracking
-from fakes import LocalArtifacts, unloading_redshift
+from fakes import LOG, LocalArtifacts, unloading_redshift
 
 
 def _run(tmp_path, monkeypatch):
@@ -46,3 +46,10 @@ def test_train_registers_tags_and_sets_only_challenger(tmp_path, monkeypatch):
     run_metrics = client.get_run(challenger.run_id).data.metrics
     assert {"mae_min", "p95_latency_ms", "champion_mae_min"} <= set(run_metrics)
     assert run_metrics["mae_min"] < run_metrics["champion_mae_min"]
+
+
+def test_only_unload_doubles_its_quotes(tmp_path, monkeypatch):
+    """'' is a quote inside UNLOAD ('...'); in a plain query it's a syntax error on Redshift."""
+    _run(tmp_path, monkeypatch)
+    plain = [sql for sql in LOG if not sql.lstrip().lower().startswith("unload")]
+    assert plain and not [sql for sql in plain if "''" in sql]
