@@ -24,3 +24,8 @@ output "rds_endpoint" {
 output "artifact_bucket" {
   value = module.artifacts.name
 }
+
+# S3: serving's MLFLOW_TRACKING_URI points at MLflow on the platform host's private address.
+output "platform_private_ip" {
+  value = module.platform.private_ip
+}
