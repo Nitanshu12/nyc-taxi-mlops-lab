@@ -1,0 +1,105 @@
+# Promote (S3): move the `champion` alias to a version the pipeline evaluated, and make serving use it.
+# The only place `champion` moves (pipelines/AGENTS.md: the pipeline sets `challenger`, never `champion`).
+#
+#   gh workflow run promote.yaml                  promote what `challenger` points at
+#   gh workflow run promote.yaml -f version=3     promote a version you name
+#
+# The job waits for a reviewer on the `production` environment before anything below runs.
+# workflow_dispatch only, on the app host's runner: nothing else can start a job there.
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Model version to promote (default: the version `challenger` points at)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: [self-hosted, lab-app]
+    environment: production
+    env:
+      MLFLOW_TRACKING_URI: ${{ vars.MLFLOW_TRACKING_URI }}
+      REQUESTED: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Which version, and did the pipeline evaluate it
+        id: pick
+        run: |
+          : "${MLFLOW_TRACKING_URI:?set the MLFLOW_TRACKING_URI repository variable (stages/S3.md)}"
+          name=$(sed -n 's/^registered_model: *//p' contracts/mlflow.yaml)
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          api="$MLFLOW_TRACKING_URI/api/2.0/mlflow"
+
+          if [[ -n "$REQUESTED" ]]; then
+            [[ "$REQUESTED" =~ ^[0-9]+$ ]] || { echo "version must be a number, got '$REQUESTED'" >&2; exit 1; }
+            version="$REQUESTED"
+          else
+            version=$(curl -sS -G "$api/registered-models/alias" --data-urlencode "name=$name" \
+              --data-urlencode "alias=challenger" | jq -r '.model_version.version // empty')
+            [[ -n "$version" ]] || { echo "no challenger to promote: run train_model first" >&2; exit 1; }
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          mv=$(curl -sS -G "$api/model-versions/get" --data-urlencode "name=$name" --data-urlencode "version=$version")
+          jq -e '.model_version' <<<"$mv" >/dev/null || { echo "$name version $version not found: $mv" >&2; exit 1; }
+          tags=$(jq -c '[.model_version.tags[]? | {(.key): .value}] | add // {}' <<<"$mv")
+          echo "version $version tags: $tags"
+
+          # Evaluated by the pipeline = it carries every tag contracts/mlflow.yaml lists, and its
+          # holdout MAE beat what it was compared against.
+          required=$(awk '/^version_tags:/{f=1;next} f&&/^  - /{print $2;next} f{exit}' contracts/mlflow.yaml)
+          for t in $required; do
+            jq -e --arg t "$t" 'has($t)' <<<"$tags" >/dev/null || { echo "version $version has no '$t' tag: the pipeline didn't evaluate it" >&2; exit 1; }
+          done
+          jq -e '(.mae_min | tonumber) < (.champion_mae_min | tonumber)' <<<"$tags" >/dev/null \
+            || { echo "version $version doesn't beat the model it was compared against: not promoting" >&2; exit 1; }
+
+      - name: Record the outgoing champion, then promote
+        env:
+          NAME: ${{ steps.pick.outputs.name }}
+          VERSION: ${{ steps.pick.outputs.version }}
+        run: |
+          api="$MLFLOW_TRACKING_URI/api/2.0/mlflow"
+          out=$(curl -sS -G "$api/registered-models/alias" --data-urlencode "name=$NAME" --data-urlencode "alias=champion")
+          previous=$(jq -r '.model_version.version // "none"' <<<"$out")
+
+          # Write it down before moving anything: on the new version (visible in MLflow) and in the run summary.
+          curl -fsS -X POST "$api/model-versions/set-tag" -H 'Content-Type: application/json' \
+            -d "$(jq -cn --arg n "$NAME" --arg v "$VERSION" --arg p "$previous" '{name: $n, version: $v, key: "previous_champion", value: $p}')" >/dev/null
+          curl -fsS -X POST "$api/registered-models/alias" -H 'Content-Type: application/json' \
+            -d "$(jq -cn --arg n "$NAME" --arg v "$VERSION" '{name: $n, alias: "champion", version: $v}')" >/dev/null
+
+          echo "champion: $previous -> $VERSION"
+          {
+            echo "### Promotion"
+            echo "- model: \`$NAME\`"
+            echo "- outgoing champion: **$previous**"
+            echo "- new champion: **$VERSION**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Make serving use it (reload, the old model answers until the new one is loaded)
+        run: deploy/web.sh reload champion
+
+      - name: Check /predict answers with the new champion
+        env:
+          VERSION: ${{ steps.pick.outputs.version }}
+        run: |
+          p=$(curl -fsS --retry 5 --retry-all-errors --retry-delay 2 -X POST http://127.0.0.1/predict \
+            -H 'Content-Type: application/json' \
+            -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}')
+          echo "$p"
+          jq -e --arg v "$VERSION" '.model.alias == "champion" and .model.version == $v' <<<"$p" >/dev/null \
+            || { echo "/predict is not answered by champion version $VERSION" >&2; exit 1; }
+          echo "promoted: /predict answered by champion version $VERSION"
+          deploy/web.sh status
