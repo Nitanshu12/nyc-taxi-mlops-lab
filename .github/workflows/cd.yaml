@@ -106,6 +106,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Image prefix for every compose command below
+        # compose.web.yaml needs it just to be read, and GHCR names are lower-case.
+        run: echo "IMAGE_PREFIX=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Prepare Traefik and the network
         run: deploy/web.sh prepare
 
@@ -114,7 +118,6 @@ jobs:
           IDLE: ${{ steps.colour.outputs.idle }}
           IMAGE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          export IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
           # Each colour keeps the tag it runs; only the idle one changes.
           other=$([[ "$IDLE" == blue ]] && echo green || echo blue)
           other_tag=$(deploy/web.sh tag "$other")
