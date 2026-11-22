@@ -15,11 +15,12 @@ from pathlib import Path
 import dagster as dg
 import mlflow
 import mlflow.pyfunc
+from mlflow.exceptions import MlflowException
 
 import tripmodel
 from tripmodel import BaselineModel, LightGBMModel, evaluate, model_signature
 
-from ..contracts import mlflow_contract
+from ..contracts import features_contract, mlflow_contract
 from ..resources import ArtifactBucket, MlflowTracking, RedshiftData
 
 
@@ -122,7 +123,7 @@ def trained_model(
     version = info.registered_model_version
     client.set_model_version_tag(model_name, version, "training_window", window)
     client.set_model_version_tag(model_name, version, "holdout_month", holdout_month)
-    client.set_model_version_tag(model_name, version, "features_version", "1")
+    client.set_model_version_tag(model_name, version, "features_version", str(features_contract()["version"]))
     client.set_model_version_tag(model_name, version, "git_sha", git_sha)
 
     # Persist the version number for downstream eval_report
@@ -138,7 +139,7 @@ def trained_model(
 
 
 @dg.asset(
-    deps=[trained_model],
+    deps=[trained_model, "taxi_zones"],  # boroughs for the airport/manhattan/outer slices
     group_name="model",
     kinds={"mlflow"},
 )
@@ -163,23 +164,36 @@ def eval_report(
     contract = mlflow_contract()
     model_name = contract["registered_model"]
 
-    # 1. Evaluate candidate model
+    # 1. Evaluate candidate model. A loaded pyfunc's predict takes (data); the (None, df) form is
+    #    only for a raw PythonModel object (see tripmodel.evaluate's docstring).
     candidate_model = mlflow.pyfunc.load_model(f"models:/{model_name}/{version}")
-    metrics = evaluate(lambda df: candidate_model.predict(None, df), holdout_df, boroughs)
+    metrics = evaluate(candidate_model.predict, holdout_df, boroughs)
 
-    # 2. Evaluate champion or baseline
-    champion_mae = None
+    # 2. Evaluate champion on the same holdout, or the v1 baseline before there is a champion.
+    #    Only a missing alias falls back; any other MLflow error fails the run.
     try:
-        champ_model = mlflow.pyfunc.load_model(f"models:/{model_name}@champion")
-        champ_metrics = evaluate(lambda df: champ_model.predict(None, df), holdout_df, boroughs)
-        champion_mae = champ_metrics["mae_min"]
-    except Exception:
-        # Fallback to v1 BaselineModel when no champion exists yet
-        base_model = BaselineModel().fit(train_df, dist_df)
-        base_metrics = evaluate(lambda df: base_model.predict(None, df), holdout_df, boroughs)
-        champion_mae = base_metrics["mae_min"]
+        client.get_model_version_by_alias(model_name, "champion")
+        has_champion = True
+    except MlflowException as e:
+        # MLflow reports a missing alias as INVALID_PARAMETER_VALUE "alias champion not found".
+        if "alias champion not found" not in str(e).lower():
+            raise
+        has_champion = False
 
-    # Log metrics and copy to version tags
+    if has_champion:
+        champ_model = mlflow.pyfunc.load_model(f"models:/{model_name}@champion")
+        champion_mae = evaluate(champ_model.predict, holdout_df, boroughs)["mae_min"]
+        compared_with = "champion"
+    else:
+        base_model = BaselineModel().fit(train_df, dist_df)
+        champion_mae = evaluate(lambda df: base_model.predict(None, df), holdout_df, boroughs)["mae_min"]
+        compared_with = "v1_baseline"
+
+    # 3. Log every contract metric on the training run, and copy the tagged ones to the version.
+    run_metrics = {**metrics, "champion_mae_min": champion_mae}
+    with mlflow.start_run(run_id=meta["run_id"]):
+        mlflow.log_metrics({k: v for k, v in run_metrics.items() if k in contract["metrics"]})
+        mlflow.set_tag("compared_with", compared_with)
     client.set_model_version_tag(model_name, version, "mae_min", f"{metrics['mae_min']:.4f}")
     client.set_model_version_tag(model_name, version, "p95_latency_ms", f"{metrics['p95_latency_ms']:.2f}")
     client.set_model_version_tag(model_name, version, "champion_mae_min", f"{champion_mae:.4f}")
@@ -200,6 +214,8 @@ def eval_report(
             "champion_mae_min": dg.MetadataValue.float(champion_mae),
             "p95_latency_ms": dg.MetadataValue.float(metrics["p95_latency_ms"]),
             "beats_champion": dg.MetadataValue.bool(metrics["mae_min"] < champion_mae),
+            "compared_with": compared_with,
+            **{k: dg.MetadataValue.float(v) for k, v in metrics.items() if k.startswith("mae_min.")},
         }
     )
 

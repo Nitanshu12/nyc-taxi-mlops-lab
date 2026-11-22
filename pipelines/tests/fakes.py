@@ -70,7 +70,8 @@ class FakeRedshift(RedshiftData):
         if "group by trip_month" in sql:
             return [{"trip_month": "2024-01", "n": self.rows}]
         if "nonpositive_duration" in sql:
-            return [{"rows": self.rows, "nonpositive_duration": 0, "over_3h": 0, "null_passengers": 0, "unknown_zone": 0}]
+            return [{"rows": self.rows, "nonpositive_duration": 0, "over_3h": 0, "null_passengers": 0,
+                     "invalid_pickup": 0, "invalid_dropoff": 0, "unknown_pickup": 0, "unknown_dropoff": 0}]
         if "as extra" in sql:
             return [{"rows": self.rows, "extra": 0}]
         if "from marts.zone_hour_stats" in sql:
