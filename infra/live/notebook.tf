@@ -12,6 +12,7 @@ module "notebook" {
     MLFLOW_TRACKING_URI = "http://${module.platform.private_ip}:5000"
     REDSHIFT_CLUSTER_ID = module.redshift.cluster_id
     REDSHIFT_DATABASE   = module.redshift.database
+    REDSHIFT_DB_USER    = module.redshift.admin_user # explore.ipynb queries through the Data API as this user
     LAB_ARTIFACT_BUCKET = module.artifacts.name
   }
 }
