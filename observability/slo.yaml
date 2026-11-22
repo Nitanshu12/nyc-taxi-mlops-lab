@@ -1,9 +1,33 @@
 # Service level objectives for the ride app (S5, decision 013). rules/slo.rules.yaml computes them.
 # One entry per SLO: what's measured (the SLI, from contracts/metrics.yaml), the objective, why that
 # number, and the alert that tells you it's being missed.
+#
+# Both objectives are 99.5% over 30 days: an error budget of 0.5%. The alerts page on a fast burn: the
+# error ratio is above 14.4x the budget (7.2%) over the last hour AND the last 5 minutes, so a short
+# spike doesn't page and a real outage does. Neither pages on fewer than ~10 requests in 5 minutes.
 slos:
   - name: predict-availability
-    sli:
-    objective:
-    why:
-    alert:
+    sli: >-
+      Share of /predict requests the app did not answer with a 5xx:
+      1 - sum(rate(lab_http_requests_total{route="/predict",code=~"5.."})) / sum(rate(lab_http_requests_total{route="/predict"})).
+      A 422 (the rider's bad input) is not an error of ours.
+    objective: 99.5% of /predict requests, over 30 days
+    why: >-
+      A quote that fails is a rider who gets nothing. 99.5% allows about 3 h 36 min of failures a month,
+      enough for a bad deploy or two but not for a day of them. 99.9% (43 min) is stricter than this lab's
+      deploys and tiny traffic support: one failed request in a quiet hour would break it. This SLI
+      alone cannot see serving being down, because the app falls back to the static median and still
+      answers 200: that is what predict-model-answered is for.
+    alert: PredictAvailabilityFastBurn
+
+  - name: predict-model-answered
+    sli: >-
+      Share of quotes the model gave, not the static-median fallback:
+      sum(rate(lab_predictions_total{source="model"})) / sum(rate(lab_predictions_total)).
+    objective: 99.5% of quotes, over 30 days
+    why: >-
+      The fallback keeps riders answered but with a worse number, and it hides every serving problem
+      (no champion, a crashed container, a timeout past 0.3 s) behind an HTTP 200. Without this SLI,
+      stopping serving-champion would not page anyone. 99.5% leaves room for a reload or a restart,
+      not for a model that stays gone.
+    alert: ModelAnsweredFastBurn

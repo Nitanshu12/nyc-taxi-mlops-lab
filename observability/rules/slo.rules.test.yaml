@@ -1,0 +1,78 @@
+# promtool unit tests for slo.rules.yaml (S5). `make check` and push-rules.sh run them.
+# Time is in minutes; each series gets one sample a minute. 60/min is 1 request a second.
+rule_files:
+  - slo.rules.yaml
+evaluation_interval: 1m
+
+tests:
+  # 1. A real outage pages. An hour of healthy traffic, then every request fails. The 1h window needs
+  #    7.2% errors (about 4.3 minutes of total outage) and the alert waits `for: 1m`.
+  - interval: 1m
+    input_series:
+      - series: 'lab_http_requests_total{route="/predict", method="POST", code="200"}'
+        values: '0+60x60 3600+0x60'
+      - series: 'lab_http_requests_total{route="/predict", method="POST", code="503"}'
+        values: '0+0x60 0+60x60'
+    alert_rule_test:
+      - eval_time: 62m   # 2 minutes in: the 1h ratio is only 3%, no page yet
+        alertname: PredictAvailabilityFastBurn
+        exp_alerts: []
+      - eval_time: 75m   # 15 minutes in: both windows are far above 7.2%
+        alertname: PredictAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: predict-availability
+            exp_annotations:
+              summary: "/predict is failing: 23.83% of requests over the last hour"
+              description: "5xx ratio is above 7.2% (14.4x the 0.5% error budget) on both the 1h and 5m windows."
+
+  # 2. A short spike doesn't page. Three minutes of failures is 5% of the hour, under the 7.2% line, even
+  #    though the 5m window is at 100%.
+  - interval: 1m
+    input_series:
+      - series: 'lab_http_requests_total{route="/predict", method="POST", code="200"}'
+        values: '0+60x60 3600+0x3 3600+60x57'
+      - series: 'lab_http_requests_total{route="/predict", method="POST", code="503"}'
+        values: '0+0x60 0+60x3 180+0x57'
+    alert_rule_test:
+      - eval_time: 64m
+        alertname: PredictAvailabilityFastBurn
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: PredictAvailabilityFastBurn
+        exp_alerts: []
+
+  # 3. Too little traffic doesn't page, even at 100% errors: half a request a minute is 2.5 in 5 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'lab_http_requests_total{route="/predict", method="POST", code="503"}'
+        values: '0+0.5x120'
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: PredictAvailabilityFastBurn
+        exp_alerts: []
+
+  # 4. Serving goes down: the app falls back and keeps answering 200. Availability stays quiet (that is
+  #    why it isn't enough alone) and the model-answered SLO is the one that pages.
+  - interval: 1m
+    input_series:
+      - series: 'lab_http_requests_total{route="/predict", method="POST", code="200"}'
+        values: '0+60x120'
+      - series: 'lab_predictions_total{source="model", alias="champion", version="2"}'
+        values: '0+60x60 3600+0x60'
+      - series: 'lab_predictions_total{source="fallback", alias="", version=""}'
+        values: '0+0x60 0+60x60'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: PredictAvailabilityFastBurn
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: ModelAnsweredFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: predict-model-answered
+            exp_annotations:
+              summary: "The static-median fallback answered 23.83% of quotes over the last hour"
+              description: "More than 7.2% of quotes (14.4x the 0.5% error budget) came from the fallback on both the 1h and 5m windows: serving has no champion, is down, or is timing out."

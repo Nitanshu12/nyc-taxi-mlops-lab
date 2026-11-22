@@ -2,4 +2,67 @@
 # Prometheus rule format: https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/
 # Metric names are contracts/metrics.yaml's. `make check` runs promtool on this file and on any
 # *.test.yaml next to it.
-groups: []
+#
+# Objective 99.5% -> error budget 0.005. Fast burn = 14.4x the budget = an error ratio of 0.072, on the
+# 1h and the 5m window together (slo.yaml, decision 013). The "* 300 >= 10" terms are the low-traffic
+# guard: no page on fewer than 10 requests (or quotes) in 5 minutes.
+groups:
+  - name: slo-predict-availability
+    interval: 1m
+    rules:
+      - record: lab:predict_requests:rate5m
+        expr: sum(rate(lab_http_requests_total{route="/predict"}[5m]))
+      - record: lab:predict_errors:ratio_rate5m
+        expr: |
+          sum(rate(lab_http_requests_total{route="/predict", code=~"5.."}[5m]))
+          /
+          sum(rate(lab_http_requests_total{route="/predict"}[5m]))
+      - record: lab:predict_errors:ratio_rate1h
+        expr: |
+          sum(rate(lab_http_requests_total{route="/predict", code=~"5.."}[1h]))
+          /
+          sum(rate(lab_http_requests_total{route="/predict"}[1h]))
+      - alert: PredictAvailabilityFastBurn
+        expr: |
+          lab:predict_errors:ratio_rate1h > 14.4 * 0.005
+          and
+          lab:predict_errors:ratio_rate5m > 14.4 * 0.005
+          and
+          lab:predict_requests:rate5m * 300 >= 10
+        for: 1m
+        labels:
+          severity: page
+          slo: predict-availability
+        annotations:
+          summary: "/predict is failing: {{ $value | humanizePercentage }} of requests over the last hour"
+          description: "5xx ratio is above 7.2% (14.4x the 0.5% error budget) on both the 1h and 5m windows."
+
+  - name: slo-predict-model-answered
+    interval: 1m
+    rules:
+      - record: lab:predictions:rate5m
+        expr: sum(rate(lab_predictions_total[5m]))
+      - record: lab:predictions_fallback:ratio_rate5m
+        expr: |
+          sum(rate(lab_predictions_total{source="fallback"}[5m]))
+          /
+          sum(rate(lab_predictions_total[5m]))
+      - record: lab:predictions_fallback:ratio_rate1h
+        expr: |
+          sum(rate(lab_predictions_total{source="fallback"}[1h]))
+          /
+          sum(rate(lab_predictions_total[1h]))
+      - alert: ModelAnsweredFastBurn
+        expr: |
+          lab:predictions_fallback:ratio_rate1h > 14.4 * 0.005
+          and
+          lab:predictions_fallback:ratio_rate5m > 14.4 * 0.005
+          and
+          lab:predictions:rate5m * 300 >= 10
+        for: 1m
+        labels:
+          severity: page
+          slo: predict-model-answered
+        annotations:
+          summary: "The static-median fallback answered {{ $value | humanizePercentage }} of quotes over the last hour"
+          description: "More than 7.2% of quotes (14.4x the 0.5% error budget) came from the fallback on both the 1h and 5m windows: serving has no champion, is down, or is timing out."
