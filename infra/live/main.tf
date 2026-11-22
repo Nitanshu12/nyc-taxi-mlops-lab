@@ -67,3 +67,11 @@ module "wiki_secret" {
   name        = "lab/wiki" # contracts/runtime.yaml: secrets.wiki
   description = "Wiki URL and token (JSON: url, token). Value put out of band."
 }
+
+# S5: Grafana Cloud's remote-write URL, user and token for Alloy (JSON: url, user, token). Only the
+# container is Terraform's; the value is put from your laptop so the token never sits in state or GitHub.
+module "grafana_secret" {
+  source      = "../modules/secret"
+  name        = "lab/grafana"
+  description = "Grafana Cloud remote-write URL, user and token (JSON: url, user, token). Value put out of band."
+}
