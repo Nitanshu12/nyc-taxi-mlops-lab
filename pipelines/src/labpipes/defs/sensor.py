@@ -23,13 +23,14 @@ _INGEST_ASSETS = dg.AssetSelection.assets(
     "trip_files", "raw_trips", "stg_trips", "zone_hour_stats", "trip_features"
 ) | dg.AssetSelection.checks_for_assets("trip_files", "stg_trips", "trip_features")
 
-trip_files_job = dg.define_asset_job(
-    "trip_files_job",
+ingest_month = dg.define_asset_job(
+    "ingest_month",
     selection=_INGEST_ASSETS,
 )
+trip_files_job = ingest_month
 
 
-@dg.sensor(job=trip_files_job, minimum_interval_seconds=60)
+@dg.sensor(job=ingest_month, minimum_interval_seconds=60)
 def trip_files_sensor(
     context: dg.SensorEvaluationContext,
     data_bucket: DataBucket,

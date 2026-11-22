@@ -65,9 +65,9 @@ def raw_trips(
         ),
         # 2. Delete this month's rows so a re-run never duplicates data.
         f"delete from ingest.raw_trips where source_file = '{file}'",
-        # 3. COPY the Parquet file by position (column names are ignored by Redshift COPY for
-        #    Parquet; source_file gets NULL because there is no matching Parquet column).
-        f"copy ingest.raw_trips ({_COL_NAMES}, source_file) "
+        # 3. COPY the 19 Parquet columns by position into the table (source_file is omitted
+        #    from the COPY column list and defaults to NULL).
+        f"copy ingest.raw_trips ({_COL_NAMES}) "
         f"from '{uri}' iam_role default format as parquet",
         # 4. Stamp every newly-loaded row with its source file name (source_file is NULL from
         #    step 3 because Parquet COPY can only map by name, not inject constants).
