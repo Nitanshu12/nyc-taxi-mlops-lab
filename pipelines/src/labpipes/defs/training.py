@@ -109,6 +109,7 @@ def trained_model(
 
     git_sha = os.environ.get("GIT_SHA", "dev")
 
+    mlflow.set_experiment(exp_name)
     with mlflow.start_run(run_name=f"train-{window}") as run:
         info = mlflow.pyfunc.log_model(
             name="model",
