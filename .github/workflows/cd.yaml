@@ -1,11 +1,21 @@
-# CD (S0): after ci.yaml succeeds on a push to main, deploy the image it built on the app host
-# (self-hosted runner, label lab-app) with deploy/compose.app.yaml, then smoke-test it.
+# CD (S3): blue-green on the app host (self-hosted runner, label lab-app), with deploy/compose.web.yaml
+# and deploy/web.sh. After ci.yaml succeeds on a push to main:
+#
+#   deploy    start the new image on the IDLE colour and smoke-test it through Traefik. Live traffic is
+#             untouched, and the old colour keeps running.
+#   switch    wait for a reviewer on the `production` environment, then send traffic to the new colour
+#             (decisions/010-blue-green-switch-trigger.md). The old colour stays up for rollback.
 #
 # Two ways in:
 #   workflow_run       the normal path. The tag comes from CI's `image-tag` artifact, never computed here.
-#   workflow_dispatch  rollback: deploy an older tag by hand, e.g.
-#                        gh workflow run cd.yaml -f image_tag=41-1a2b3c4
+#   workflow_dispatch  by hand:
+#                        gh workflow run cd.yaml -f image_tag=41-1a2b3c4   deploy an older tag (same gates)
+#                        gh workflow run rollback.yaml                     switch back to the other colour:
+#                                                                         no build, no deploy, no approval
 #                      List tags: gh api "users/<owner>/packages/container/<repo>%2Fapp/versions" --jq '.[].metadata.container.tags[]'
+#
+# The very first run on this stack has no live colour yet (the old S0 stack goes away), so it switches
+# straight after the smoke test: there is no live traffic to protect and nothing to roll back to.
 #
 # Never triggered by pull_request. workflow_run only deploys a successful *push* run from *this*
 # repo: a fork's PR CI run (even from a branch named main) also fires workflow_run.
@@ -19,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Image tag to deploy (rollback), e.g. 41-1a2b3c4"
+        description: "Image tag to deploy, e.g. 41-1a2b3c4"
         required: true
         type: string
 
@@ -42,10 +52,14 @@ jobs:
       contents: read
       packages: read
       actions: read # CI's image-tag artifact
+    outputs:
+      idle: ${{ steps.colour.outputs.idle }}
+      first: ${{ steps.colour.outputs.first }}
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          # The commit CI built, so the Compose file matches the image. A rollback uses main's.
+          # The commit CI built, so the Compose file matches the image. A dispatch uses main's.
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Get the tag from CI
@@ -71,38 +85,107 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Deploying app:$tag"
 
+      - name: Which colour is idle
+        id: colour
+        run: |
+          live=$(deploy/web.sh live)
+          case "$live" in
+            blue)  idle=green; first=false ;;
+            green) idle=blue;  first=false ;;
+            *)     idle=blue;  first=true ;;
+          esac
+          echo "live=$live idle=$idle first=$first"
+          {
+            echo "idle=$idle"
+            echo "first=$first"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Deploy
+      - name: Prepare Traefik and the network
+        run: deploy/web.sh prepare
+
+      - name: Deploy to the idle colour
         env:
+          IDLE: ${{ steps.colour.outputs.idle }}
           IMAGE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
           export IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
-          docker compose -f deploy/compose.app.yaml pull
-          docker compose -f deploy/compose.app.yaml up -d --wait --remove-orphans
+          # Each colour keeps the tag it runs; only the idle one changes.
+          other=$([[ "$IDLE" == blue ]] && echo green || echo blue)
+          if [[ "$IDLE" == blue ]]; then
+            export BLUE_TAG="$IMAGE_TAG" GREEN_TAG="$(deploy/web.sh tag "$other")"
+          else
+            export GREEN_TAG="$IMAGE_TAG" BLUE_TAG="$(deploy/web.sh tag "$other")"
+          fi
+          docker compose -f deploy/compose.web.yaml pull "app-$IDLE"
+          docker compose -f deploy/compose.web.yaml up -d --wait --no-deps --remove-orphans "app-$IDLE"
 
-      - name: Smoke test through Traefik
+      - name: Smoke test the idle colour through Traefik
         env:
+          IDLE: ${{ steps.colour.outputs.idle }}
           IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          base=http://127.0.0.1
-          v=$(curl -fsS --retry 10 --retry-all-errors --retry-delay 3 "$base/version")
-          echo "$v"
-          # The running image is the one we asked for: its tag, and the commit in that tag.
-          jq -e --arg tag "$IMAGE_TAG" --arg sha "${IMAGE_TAG#*-}" \
-            '.image_tag == $tag and (.git_sha | startswith($sha))' <<<"$v" >/dev/null
-          curl -fsS -X POST "$base/predict" -H 'Content-Type: application/json' \
-            -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}'
-          echo
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/predict" -H 'Content-Type: application/json' \
-            -d '{"pickup_zone_id": 999, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}')
-          [[ "$code" == 422 ]] || { echo "invalid zone returned $code, expected 422" >&2; exit 1; }
-          echo "smoke ok: app:$IMAGE_TAG"
+          # /version and a /predict, pinned to the idle colour by the X-Lab-Color header.
+          deploy/web.sh smoke "$IDLE" "$CI_SHA"
+          ran=$(deploy/web.sh tag "$IDLE")
+          [[ "$ran" == "$IMAGE_TAG" ]] || { echo "$IDLE runs $ran, expected $IMAGE_TAG" >&2; exit 1; }
+          echo "smoke ok: app-$IDLE runs app:$IMAGE_TAG, live traffic untouched"
 
       - name: Log out of GHCR
         if: always()
         run: docker logout ghcr.io
+
+  # First run on this stack only: nothing is live yet, so there is nothing to review or to protect.
+  switch-first:
+    needs: deploy
+    if: >-
+      needs.deploy.outputs.first == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: [self-hosted, lab-app]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Switch to the first colour
+        env:
+          IDLE: ${{ needs.deploy.outputs.idle }}
+        run: |
+          deploy/web.sh switch "$IDLE"
+          deploy/web.sh status
+
+  # Every later run waits here until a reviewer approves the `production` environment.
+  switch:
+    needs: deploy
+    if: >-
+      needs.deploy.outputs.first != 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: [self-hosted, lab-app]
+    environment: production
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Switch traffic to the new colour
+        env:
+          IDLE: ${{ needs.deploy.outputs.idle }}
+          IMAGE_TAG: ${{ needs.deploy.outputs.tag }}
+        run: |
+          deploy/web.sh switch "$IDLE"
+          # Through Traefik with no pinning header: what a rider reaches now.
+          v=$(curl -fsS --retry 10 --retry-all-errors --retry-delay 2 http://127.0.0.1/version)
+          echo "$v"
+          jq -e --arg tag "$IMAGE_TAG" '.image_tag == $tag' <<<"$v" >/dev/null \
+            || { echo "traffic does not reach app:$IMAGE_TAG after the switch" >&2; exit 1; }
+          deploy/web.sh status

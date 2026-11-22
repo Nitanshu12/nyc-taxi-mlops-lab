@@ -1,0 +1,40 @@
+# Rollback (S3): send app traffic back to the other colour. The idle colour still runs the previous
+# release (cd.yaml keeps it up after a switch), so this is a routing change only: no build, no image
+# pull, no deploy. No approval either: a rollback has to be one command.
+#
+#   gh workflow run rollback.yaml
+#
+# Run it again to switch forward. workflow_dispatch only: nothing else can trigger a job on the app host.
+name: rollback
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-app # never during a deploy
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: [self-hosted, lab-app]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Switch back to the other colour
+        run: |
+          start=$(date +%s.%N)
+          live=$(deploy/web.sh live)
+          case "$live" in
+            blue)  other=green ;;
+            green) other=blue ;;
+            *) echo "no live colour yet: nothing to roll back" >&2; exit 1 ;;
+          esac
+          [[ "$(deploy/web.sh tag "$other")" != none ]] || { echo "$other isn't running: nothing to roll back to" >&2; exit 1; }
+          deploy/web.sh smoke "$other"
+          deploy/web.sh switch "$other"
+          v=$(curl -fsS --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1/version)
+          echo "now live: $v"
+          echo "rollback took $(awk -v s="$start" -v e="$(date +%s.%N)" 'BEGIN { printf "%.1f", e - s }') s (smoke test included)"
+          deploy/web.sh status
